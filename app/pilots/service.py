@@ -35,8 +35,12 @@ class PilotOperationsService:
             repository = PilotRepository(connection)
             if repository.protocol_by_code(payload["code"]):
                 raise ConflictError("参数方案编码已存在")
+            product_code = (payload.get("product_code") or "").strip().lower()
+            if product_code and connection.execute("SELECT 1 FROM health_products WHERE code=?", (product_code,)).fetchone() is None:
+                raise NotFoundError("关联的健康创新产品不存在")
             return repository.create_protocol(
                 code=payload["code"], name=payload["name"], capability=payload["capability"],
+                product_code=product_code,
                 parameter_schema=payload["parameter_schema"], defaults=payload["default_parameters"],
                 max_runtime_seconds=payload["max_runtime_seconds"], max_attempts=payload["max_attempts"],
                 created_by=actor, now=now,
@@ -58,6 +62,17 @@ class PilotOperationsService:
             parameters = self._validate_parameters(protocol, payload["parameters"])
             existing = repository.session_by_idempotency(payload["requested_by"], payload["idempotency_key"])
             parameter_digest = digest(parameters)
+            product_code = protocol["product_code"] or ""
+            if product_code:
+                product_row = connection.execute("SELECT active FROM health_products WHERE code=?", (product_code,)).fetchone()
+                if product_row is None or not product_row["active"]:
+                    raise ConflictError("关联产品已停用，不能创建新场次")
+                blocked = connection.execute(
+                    "SELECT 1 FROM product_safety_actions WHERE product_code=? AND action_type='suspension' AND status='active' LIMIT 1",
+                    (product_code,),
+                ).fetchone()
+                if blocked is not None:
+                    raise ConflictError("产品因安全处置处于暂停状态，新场次已被阻止")
             if existing is not None:
                 if existing["parameter_digest"] != parameter_digest:
                     raise ConflictError("同一幂等键对应了不同的试点参数")
@@ -65,6 +80,7 @@ class PilotOperationsService:
             self._check_quota(repository, payload["requested_by"], now_value)
             return repository.create_session(
                 protocol_id=protocol["id"], project_code=payload["project_code"],
+                product_code=product_code,
                 requested_by=payload["requested_by"], parameters=parameters,
                 parameter_digest=parameter_digest, priority=payload["priority"],
                 idempotency_key=payload["idempotency_key"], max_attempts=protocol["max_attempts"], now=now,
@@ -159,6 +175,11 @@ class PilotOperationsService:
         def mutate(connection: sqlite3.Connection, session: sqlite3.Row, now: str) -> None:
             if session["status"] not in {"failed", "cancelled"}:
                 raise ConflictError("只有失败或已取消体验场次可以人工重试")
+            if session["product_code"] and connection.execute(
+                "SELECT 1 FROM product_safety_actions WHERE product_code=? AND action_type='suspension' AND status='active' LIMIT 1",
+                (session["product_code"],),
+            ).fetchone() is not None:
+                raise ConflictError("产品因安全处置处于暂停状态，不能重试场次")
             chosen = session["priority"] if priority is None else priority
             connection.execute("UPDATE pilot_sessions SET status='queued',priority=?,available_at=?,lease_owner='',lease_expires_at='',finished_at=NULL,updated_at=?,version=version+1 WHERE id=?", (chosen, now, now, session["id"]))
         return self._intervene(session_id, actor, reason, "retry", batch_key, mutate)

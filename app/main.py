@@ -10,6 +10,7 @@ from app.catalog.router import router as catalog_router
 from app.core.errors import DomainError
 from app.database import close_connection, init_db
 from app.pilots.router import router as pilot_router
+from app.safety.router import router as safety_router
 
 
 @asynccontextmanager
@@ -41,6 +42,7 @@ app.include_router(departments_admin.router)
 app.include_router(maintenance.router)
 app.include_router(catalog_router)
 app.include_router(pilot_router)
+app.include_router(safety_router)
 
 
 @app.get("/")

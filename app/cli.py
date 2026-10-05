@@ -100,6 +100,57 @@ def pilot_demo() -> int:
     return 0
 
 
+def safety_demo() -> int:
+    with tempfile.TemporaryDirectory(prefix="health-safety-") as directory:
+        os.environ["HEALTH_INNOVATION_DATABASE_PATH"] = os.path.join(directory, "safety.db")
+        close_connection()
+        with TestClient(app) as client:
+            product = client.post("/api/catalog/products", json={
+                "code": "dt-sleep",
+                "name": "睡眠数字疗法应用",
+                "organization": "示例数字医疗",
+                "origin_country": "中国",
+                "category": "数字疗法",
+                "intended_use": "用于成人慢性失眠的数字认知行为干预与睡眠日志管理",
+                "risk_level": "medium",
+                "regulatory_status": "已注册",
+            })
+            site = client.post("/api/catalog/sites", json={
+                "code": "clinic-hz", "name": "杭州临床观察点", "site_type": "医院",
+                "region": "浙江", "capabilities": ["dt-cbti"], "max_concurrent": 2,
+            })
+            protocol = client.post("/api/pilots/protocols?actor=demo", json={
+                "code": "dt-cbti", "name": "失眠数字疗法方案", "capability": "dt-cbti",
+                "product_code": "dt-sleep",
+                "parameter_schema": {"weeks": {"type": "integer", "required": True, "minimum": 1, "maximum": 12}},
+                "max_runtime_seconds": 1800, "max_attempts": 2,
+            })
+            submitted = client.post("/api/pilots/sessions", json={
+                "protocol_code": "dt-cbti", "project_code": "safety-2026", "requested_by": "demo-operator",
+                "parameters": {"weeks": 4}, "priority": 60, "idempotency_key": "safety-demo-session-1",
+            })
+            reported = client.post("/api/safety/reports", json={
+                "report_key": "safety-demo-report-1", "product_code": "dt-sleep", "site_code": "clinic-hz",
+                "session_id": submitted.json()["id"], "severity": "severe", "symptoms": ["夜间惊恐发作"],
+                "occurrence_at": "2026-10-05T10:00:00+00:00", "description": "受试者完成干预当晚出现发作",
+                "channel": "现场系统", "reporter_ref": "demo-nurse",
+            })
+            delivered = client.post("/api/safety/notices/deliver-pending")
+            values = [product, site, protocol, submitted, reported, delivered]
+            if any(response.status_code >= 400 for response in values):
+                _print({"errors": [response.text for response in values]})
+                return 1
+            suspension = reported.json()["suspension"]
+            _print({
+                "report_id": reported.json()["report_id"],
+                "suspension": suspension["decision_uid"],
+                "scope_session_ids": suspension["scope_session_ids"],
+                "delivered_notices": delivered.json()["delivered"],
+            })
+        close_connection()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="全球健康创新试点运营服务命令行")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -107,12 +158,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("check-db", help="检查数据库完整性")
     sub.add_parser("smoke", help="进程内检查根路径和健康接口")
     sub.add_parser("pilot-demo", help="运行产品、场地、方案和场次演示")
+    sub.add_parser("safety-demo", help="运行不良事件上报到产品暂停通知的安全处置链演示")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     command = build_parser().parse_args(argv).command
-    actions = {"init-db": init_database, "check-db": check_database, "smoke": smoke, "pilot-demo": pilot_demo}
+    actions = {"init-db": init_database, "check-db": check_database, "smoke": smoke, "pilot-demo": pilot_demo, "safety-demo": safety_demo}
     try:
         return actions[command]()
     finally:

@@ -195,6 +195,7 @@ CREATE TABLE IF NOT EXISTS pilot_protocols (
     code TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     capability TEXT NOT NULL,
+    product_code TEXT NOT NULL DEFAULT '',
     version INTEGER NOT NULL DEFAULT 1,
     parameter_schema_json TEXT NOT NULL,
     default_parameters_json TEXT NOT NULL DEFAULT '{}',
@@ -221,6 +222,7 @@ CREATE TABLE IF NOT EXISTS pilot_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     protocol_id INTEGER NOT NULL REFERENCES pilot_protocols(id) ON DELETE RESTRICT,
     project_code TEXT NOT NULL,
+    product_code TEXT NOT NULL DEFAULT '',
     requested_by TEXT NOT NULL,
     parameters_json TEXT NOT NULL,
     parameter_digest TEXT NOT NULL,
@@ -266,6 +268,132 @@ CREATE TABLE IF NOT EXISTS pilot_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pilot_interventions ON pilot_interventions(session_id,id);
+
+-- 跨场地安全处置链 -----------------------------------------------------------
+-- 产品级暂停触发规则：达到任一条件即阻止新场次并下发同一份产品级决定。
+CREATE TABLE IF NOT EXISTS safety_trigger_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    severe_severities_json TEXT NOT NULL,
+    cluster_signal_count INTEGER NOT NULL CHECK(cluster_signal_count > 0),
+    cluster_window_hours INTEGER NOT NULL CHECK(cluster_window_hours > 0),
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    updated_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+-- 严重程度按医学惯例分级；调查状态覆盖分诊、升级到产品暂停再到双人解除的全流程。
+CREATE TABLE IF NOT EXISTS safety_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_key TEXT NOT NULL UNIQUE,
+    product_id INTEGER NOT NULL REFERENCES health_products(id) ON DELETE RESTRICT,
+    product_code TEXT NOT NULL,
+    site_id INTEGER REFERENCES pilot_sites(id) ON DELETE SET NULL,
+    site_code TEXT NOT NULL DEFAULT '',
+    session_id INTEGER REFERENCES pilot_sessions(id) ON DELETE SET NULL,
+    severity TEXT NOT NULL CHECK(severity IN ('mild','moderate','severe','life_threatening','death')),
+    symptoms_json TEXT NOT NULL,
+    symptoms_digest TEXT NOT NULL,
+    signal_key TEXT NOT NULL DEFAULT '',
+    dedup_fingerprint TEXT NOT NULL DEFAULT '',
+    occurrence_at TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    reporter_channel TEXT NOT NULL DEFAULT '',
+    reporter_ref TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'submitted' CHECK(status IN ('submitted','information_requested','investigating','related_unlikely','related_excluded','escalated')),
+    first_signal_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_safety_product ON safety_reports(product_id,occurrence_at,id);
+CREATE INDEX IF NOT EXISTS idx_safety_status ON safety_reports(status);
+
+-- 同一事件的不同渠道上报通过指纹合并，来源追加到 report_sources，不重复计数。
+CREATE TABLE IF NOT EXISTS safety_report_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id INTEGER NOT NULL REFERENCES safety_reports(id) ON DELETE CASCADE,
+    channel TEXT NOT NULL,
+    reporter_ref TEXT NOT NULL DEFAULT '',
+    received_at TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(report_id, channel, reporter_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_safety_sources_report ON safety_report_sources(report_id,id);
+
+-- append-only 时间线：任何判断、补充材料、迟到回执都只能追加，禁止更新或删除。
+CREATE TABLE IF NOT EXISTS safety_timeline_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id INTEGER NOT NULL REFERENCES safety_reports(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL,
+    event_type TEXT NOT NULL CHECK(event_type IN ('report','information_request','supplement','triage','investigation','late_receipt','closure_note')),
+    actor TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(report_id, sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_safety_timeline_report ON safety_timeline_events(report_id,sequence);
+
+-- 分诊及调查决定：要求补充、排除关联、升级调查或触发产品级暂停。
+CREATE TABLE IF NOT EXISTS safety_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id INTEGER NOT NULL REFERENCES safety_reports(id) ON DELETE RESTRICT,
+    decision TEXT NOT NULL CHECK(decision IN ('request_information','exclude_relation','escalate_investigation','trigger_suspension')),
+    reason TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    related_finding TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_safety_decisions_report ON safety_decisions(report_id,id);
+
+-- 产品级暂停及双人解除：调查结论一经写定不得改写；解除必须两名不同审阅人。
+CREATE TABLE IF NOT EXISTS product_safety_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL REFERENCES health_products(id) ON DELETE RESTRICT,
+    product_code TEXT NOT NULL,
+    action_type TEXT NOT NULL DEFAULT 'suspension' CHECK(action_type IN ('suspension','resumption')),
+    related_action_id INTEGER REFERENCES product_safety_actions(id),
+    reason TEXT NOT NULL,
+    rule_json TEXT NOT NULL DEFAULT '{}',
+    triggered_by TEXT NOT NULL,
+    triggered_report_ids_json TEXT NOT NULL DEFAULT '[]',
+    investigation_summary TEXT NOT NULL DEFAULT '',
+    scope_session_ids_json TEXT NOT NULL DEFAULT '[]',
+    product_active_before INTEGER NOT NULL DEFAULT 1 CHECK(product_active_before IN (0,1)),
+    decision_uid TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','lifted')),
+    lifted_at TEXT,
+    lift_reason TEXT NOT NULL DEFAULT '',
+    lift_reviewer1 TEXT NOT NULL DEFAULT '',
+    lift_reviewer1_at TEXT,
+    lift_reviewer2 TEXT NOT NULL DEFAULT '',
+    lift_reviewer2_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_product_safety_product ON product_safety_actions(product_id,id);
+
+-- 同一份暂停/解除决定投递给每个受影响场次；持久 outbox，崩溃恢复后只投递一次。
+CREATE TABLE IF NOT EXISTS safety_session_notices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action_id INTEGER NOT NULL REFERENCES product_safety_actions(id) ON DELETE CASCADE,
+    decision_uid TEXT NOT NULL,
+    product_code TEXT NOT NULL,
+    session_id INTEGER NOT NULL REFERENCES pilot_sessions(id) ON DELETE CASCADE,
+    site_code TEXT NOT NULL DEFAULT '',
+    recipient TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL CHECK(kind IN ('suspension','resumption')),
+    delivery_status TEXT NOT NULL DEFAULT 'pending' CHECK(delivery_status IN ('pending','delivered','acknowledged','failed','superseded')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    delivered_at TEXT,
+    acknowledged_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(action_id, session_id, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_safety_notices_pending ON safety_session_notices(delivery_status,id);
+CREATE INDEX IF NOT EXISTS idx_safety_notices_session ON safety_session_notices(session_id,id);
 '''
 
 
@@ -282,6 +410,9 @@ PERMISSIONS = [
     ("feedback.read", "查看体验反馈", "feedback", "read"),
     ("audit.read", "查看审计", "audit", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
+    ("safety.read", "查看安全处置链", "safety", "read"),
+    ("safety.triage", "医学分诊与调查", "safety", "triage"),
+    ("safety.lift", "双人解除产品暂停", "safety", "lift"),
 ]
 
 
@@ -334,7 +465,9 @@ def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
+        _ensure_columns(connection, "pilot_protocols", {"product_code": "TEXT NOT NULL DEFAULT ''"})
+        _ensure_columns(connection, "pilot_sessions", {"product_code": "TEXT NOT NULL DEFAULT ''"})
+        connection.execute("PRAGMA user_version=3")
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -344,6 +477,7 @@ def init_db() -> None:
             ("administrator", "系统管理员", "拥有全部系统权限"),
             ("operator", "试点运营员", "维护目录、场地和体验场次"),
             ("reviewer", "证据审阅员", "审阅产品证据与体验反馈"),
+            ("safety_officer", "安全处置员", "不良事件分诊、产品暂停处置与解除会签"),
             ("auditor", "审计查看员", "只读查看运行与审计记录"),
         ]
         for code, name, description in roles:
@@ -356,7 +490,25 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
         )
+        safety_officer = connection.execute("SELECT id FROM roles WHERE code='safety_officer'").fetchone()[0]
+        connection.execute(
+            "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions WHERE code IN ('safety.read','safety.triage','safety.lift')",
+            (safety_officer, now),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO safety_trigger_rules(code,severe_severities_json,cluster_signal_count,cluster_window_hours,active,updated_by,created_at,updated_at) "
+            "VALUES('default','[\"severe\",\"life_threatening\",\"death\"]',3,72,1,'system',?,?)",
+            (now, now),
+        )
+        connection.execute("PRAGMA user_version=3")
 
 
 def migrate_db() -> None:
     init_db()
+
+
+def _ensure_columns(connection: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, declaration in columns.items():
+        if name not in existing:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
