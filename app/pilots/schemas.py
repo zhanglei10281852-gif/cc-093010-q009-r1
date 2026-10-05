@@ -9,6 +9,7 @@ class ProtocolCreate(BaseModel):
     code: str = Field(min_length=2, max_length=64, pattern=r"^[a-z0-9][a-z0-9._-]+$")
     name: str = Field(min_length=2, max_length=120)
     capability: str = Field(min_length=2, max_length=120)
+    product_code: str = Field(default="", max_length=64)
     parameter_schema: dict[str, dict[str, Any]]
     default_parameters: dict[str, Any] = Field(default_factory=dict)
     max_runtime_seconds: int = Field(default=600, ge=1, le=86400)
@@ -25,6 +26,7 @@ class QuotaSet(BaseModel):
 
 class SessionSubmit(BaseModel):
     protocol_code: str = Field(min_length=2, max_length=64)
+    product_code: str = Field(default="", max_length=64)
     project_code: str = Field(min_length=1, max_length=80)
     requested_by: str = Field(min_length=1, max_length=80)
     parameters: dict[str, Any]

@@ -47,6 +47,15 @@ class MaintenanceService:
         "pilot_sessions",
         "pilot_observations",
         "pilot_interventions",
+        "safety_reports",
+        "safety_report_sources",
+        "safety_timeline",
+        "safety_investigations",
+        "safety_decisions",
+        "safety_decision_approvals",
+        "safety_decision_sessions",
+        "safety_notifications",
+        "safety_signal_rules",
     )
 
     def __init__(self, connection: sqlite3.Connection, clock: Clock | None = None) -> None:

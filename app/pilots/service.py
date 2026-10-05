@@ -35,8 +35,12 @@ class PilotOperationsService:
             repository = PilotRepository(connection)
             if repository.protocol_by_code(payload["code"]):
                 raise ConflictError("参数方案编码已存在")
+            product_code = (payload.get("product_code") or "").strip().lower()
+            if product_code and connection.execute("SELECT 1 FROM health_products WHERE code=?", (product_code,)).fetchone() is None:
+                raise NotFoundError("关联的健康创新产品不存在")
             return repository.create_protocol(
                 code=payload["code"], name=payload["name"], capability=payload["capability"],
+                product_code=product_code,
                 parameter_schema=payload["parameter_schema"], defaults=payload["default_parameters"],
                 max_runtime_seconds=payload["max_runtime_seconds"], max_attempts=payload["max_attempts"],
                 created_by=actor, now=now,
@@ -55,16 +59,31 @@ class PilotOperationsService:
             protocol = repository.protocol_by_code(payload["protocol_code"])
             if protocol is None or not protocol["active"]:
                 raise NotFoundError("参数方案不存在或已经停用")
+            product_code = (payload.get("product_code") or protocol["product_code"] or "").strip().lower()
+            if not product_code:
+                raise ValidationError("提交场次必须关联健康创新产品")
+            if protocol["product_code"] and product_code != protocol["product_code"]:
+                raise ConflictError("场次关联产品与体验方案绑定产品不一致")
             parameters = self._validate_parameters(protocol, payload["parameters"])
             existing = repository.session_by_idempotency(payload["requested_by"], payload["idempotency_key"])
             parameter_digest = digest(parameters)
             if existing is not None:
                 if existing["parameter_digest"] != parameter_digest:
                     raise ConflictError("同一幂等键对应了不同的试点参数")
+                # 暂停后的幂等重放返回既有的被阻断场次，而不是再次拒绝。
                 return dict(repository.session_by_id(existing["id"]))
+            product = connection.execute("SELECT * FROM health_products WHERE code=?", (product_code,)).fetchone()
+            if product is None:
+                raise NotFoundError("关联的健康创新产品不存在")
+            active_suspension = connection.execute(
+                "SELECT decision_no FROM safety_decisions WHERE product_code=? AND action='product_suspension' AND status='active'",
+                (product_code,),
+            ).fetchone()
+            if active_suspension is not None:
+                raise ConflictError("该产品处于安全暂停期，新场次已被阻止", context={"decision_no": active_suspension["decision_no"]})
             self._check_quota(repository, payload["requested_by"], now_value)
             return repository.create_session(
-                protocol_id=protocol["id"], project_code=payload["project_code"],
+                protocol_id=protocol["id"], product_code=product_code, project_code=payload["project_code"],
                 requested_by=payload["requested_by"], parameters=parameters,
                 parameter_digest=parameter_digest, priority=payload["priority"],
                 idempotency_key=payload["idempotency_key"], max_attempts=protocol["max_attempts"], now=now,

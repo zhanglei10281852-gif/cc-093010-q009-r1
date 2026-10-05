@@ -11,6 +11,7 @@ PROTOCOL = {
     "code": "gait-assist",
     "name": "外骨骼步态体验方案",
     "capability": "gait-assist",
+    "product_code": "exoskeleton-a",
     "parameter_schema": {
         "minutes": {"type": "integer", "required": True, "minimum": 1, "maximum": 30},
         "assist_level": {"type": "number", "required": False, "minimum": 0.0, "maximum": 1.0},
@@ -21,10 +22,22 @@ PROTOCOL = {
     "max_attempts": 2,
 }
 
+PRODUCT = {
+    "code": "exoskeleton-a",
+    "name": "轻量助力外骨骼",
+    "organization": "示例康复科技",
+    "origin_country": "中国",
+    "category": "康复设备",
+    "intended_use": "用于展会和康复机构的步态助力体验与运行数据观察",
+    "risk_level": "medium",
+    "regulatory_status": "展示",
+}
+
 
 def submit_payload(key: str, *, user: str = "pilot-operator-1", priority: int = 50) -> dict:
     return {
         "protocol_code": "gait-assist",
+        "product_code": "exoskeleton-a",
         "project_code": "expo-health-a",
         "requested_by": user,
         "parameters": {"minutes": 8, "scene": "stairs"},
@@ -33,7 +46,13 @@ def submit_payload(key: str, *, user: str = "pilot-operator-1", priority: int = 
     }
 
 
+def create_product(client) -> None:
+    response = client.post("/api/catalog/products", json=PRODUCT)
+    assert response.status_code == 201, response.text
+
+
 def create_protocol(client) -> None:
+    create_product(client)
     response = client.post("/api/pilots/protocols?actor=administrator", json=PROTOCOL)
     assert response.status_code == 201, response.text
 
@@ -97,11 +116,13 @@ def test_quota_cancel_retry_priority_and_batch_interventions(client):
 
 
 def test_failure_backoff_and_expired_lease_recovery(client):
+    from app.catalog.service import CatalogService
     from app.database import init_db
 
     init_db()
     clock = FrozenClock(datetime(2026, 9, 26, 2, 0, tzinfo=UTC))
     service = PilotOperationsService(get_connection(), clock)
+    CatalogService(get_connection(), clock).create_product(PRODUCT)
     service.create_protocol(PROTOCOL, "administrator")
     first = service.submit(submit_payload("failure-000001"))
     claimed = service.claim("site-a", ["gait-assist"], 10)

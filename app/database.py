@@ -195,6 +195,7 @@ CREATE TABLE IF NOT EXISTS pilot_protocols (
     code TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     capability TEXT NOT NULL,
+    product_code TEXT NOT NULL DEFAULT '',
     version INTEGER NOT NULL DEFAULT 1,
     parameter_schema_json TEXT NOT NULL,
     default_parameters_json TEXT NOT NULL DEFAULT '{}',
@@ -221,17 +222,19 @@ CREATE TABLE IF NOT EXISTS pilot_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     protocol_id INTEGER NOT NULL REFERENCES pilot_protocols(id) ON DELETE RESTRICT,
     project_code TEXT NOT NULL,
+    product_code TEXT NOT NULL DEFAULT '',
     requested_by TEXT NOT NULL,
     parameters_json TEXT NOT NULL,
     parameter_digest TEXT NOT NULL,
     priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),
     idempotency_key TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed')),
+    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed','blocked','safety_hold')),
     attempt_count INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
     available_at TEXT NOT NULL,
     lease_owner TEXT NOT NULL DEFAULT '',
     lease_expires_at TEXT NOT NULL DEFAULT '',
+    blocked_by_decision_no TEXT NOT NULL DEFAULT '',
     current_observation_version INTEGER,
     last_error_code TEXT NOT NULL DEFAULT '',
     last_error_message TEXT NOT NULL DEFAULT '',
@@ -243,6 +246,7 @@ CREATE TABLE IF NOT EXISTS pilot_sessions (
     UNIQUE(requested_by, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS idx_pilot_queue ON pilot_sessions(status,priority DESC,available_at,created_at);
+CREATE INDEX IF NOT EXISTS idx_pilot_sessions_product ON pilot_sessions(product_code,status);
 CREATE TABLE IF NOT EXISTS pilot_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id INTEGER NOT NULL REFERENCES pilot_sessions(id) ON DELETE CASCADE,
@@ -266,6 +270,128 @@ CREATE TABLE IF NOT EXISTS pilot_interventions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pilot_interventions ON pilot_interventions(session_id,id);
+
+-- 跨场地安全处置链：不良事件报告、医学分诊、调查、产品级暂停决定、通知外箱、双审阅解除
+CREATE TABLE IF NOT EXISTS safety_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_no TEXT NOT NULL UNIQUE,
+    product_code TEXT NOT NULL,
+    session_id INTEGER REFERENCES pilot_sessions(id),
+    site_code TEXT NOT NULL DEFAULT '',
+    symptoms_json TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK(severity IN ('mild','moderate','serious','critical')),
+    event_occurred_at TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','info_requested','investigating','excluded','closed')),
+    fingerprint TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_safety_reports_product ON safety_reports(product_code,status,severity);
+CREATE INDEX IF NOT EXISTS idx_safety_reports_session ON safety_reports(session_id);
+CREATE TABLE IF NOT EXISTS safety_report_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id INTEGER NOT NULL REFERENCES safety_reports(id) ON DELETE CASCADE,
+    channel TEXT NOT NULL,
+    external_ref TEXT NOT NULL DEFAULT '',
+    reporter TEXT NOT NULL DEFAULT '',
+    received_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(report_id, channel, external_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_safety_sources_lookup ON safety_report_sources(channel,external_ref);
+CREATE TABLE IF NOT EXISTS safety_timeline (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id INTEGER NOT NULL REFERENCES safety_reports(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    entry_type TEXT NOT NULL CHECK(entry_type IN ('report','source_merge','triage','investigation','decision','decision_effect','acknowledgement','closure')),
+    actor TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(report_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_safety_timeline_report ON safety_timeline(report_id,id);
+CREATE TABLE IF NOT EXISTS safety_investigations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id INTEGER REFERENCES safety_reports(id),
+    investigation_no TEXT NOT NULL UNIQUE,
+    product_code TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','concluded','superseded')),
+    opened_by TEXT NOT NULL,
+    opened_at TEXT NOT NULL,
+    concluded_by TEXT NOT NULL DEFAULT '',
+    concluded_at TEXT,
+    conclusion TEXT NOT NULL DEFAULT '',
+    related_signal_json TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_safety_investigations_product ON safety_investigations(product_code,status);
+CREATE TABLE IF NOT EXISTS safety_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_no TEXT NOT NULL UNIQUE,
+    product_code TEXT NOT NULL,
+    action TEXT NOT NULL CHECK(action IN ('product_suspension','resumption')),
+    scope TEXT NOT NULL DEFAULT 'product' CHECK(scope IN ('product')),
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','lifted')),
+    trigger_rule TEXT NOT NULL DEFAULT '',
+    report_id INTEGER REFERENCES safety_reports(id),
+    investigation_id INTEGER REFERENCES safety_investigations(id),
+    resumes_decision_id INTEGER REFERENCES safety_decisions(id),
+    issued_by TEXT NOT NULL,
+    issued_at TEXT NOT NULL,
+    lifted_at TEXT,
+    lift_reason TEXT NOT NULL DEFAULT '',
+    lift_summary TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_safety_decisions_product ON safety_decisions(product_code,status);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_safety_active_suspension ON safety_decisions(product_code) WHERE action='product_suspension' AND status='active';
+CREATE TABLE IF NOT EXISTS safety_decision_approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_id INTEGER NOT NULL REFERENCES safety_decisions(id) ON DELETE CASCADE,
+    reviewer TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    approved_at TEXT NOT NULL,
+    UNIQUE(decision_id, reviewer)
+);
+CREATE TABLE IF NOT EXISTS safety_decision_sessions (
+    decision_id INTEGER NOT NULL REFERENCES safety_decisions(id) ON DELETE CASCADE,
+    session_id INTEGER NOT NULL REFERENCES pilot_sessions(id),
+    previous_status TEXT NOT NULL,
+    effect TEXT NOT NULL CHECK(effect IN ('blocked','held','released')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(decision_id, session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_safety_decision_sessions_session ON safety_decision_sessions(session_id);
+CREATE TABLE IF NOT EXISTS safety_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_id INTEGER NOT NULL REFERENCES safety_decisions(id) ON DELETE CASCADE,
+    recipient TEXT NOT NULL,
+    channel TEXT NOT NULL DEFAULT 'site',
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','delivered','acknowledged','failed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    dedup_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(decision_id, recipient, channel)
+);
+CREATE INDEX IF NOT EXISTS idx_safety_notifications_status ON safety_notifications(status,id);
+CREATE TABLE IF NOT EXISTS safety_signal_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    severity_in_json TEXT NOT NULL DEFAULT '[]',
+    min_count INTEGER NOT NULL CHECK(min_count > 0),
+    window_seconds INTEGER NOT NULL CHECK(window_seconds > 0),
+    same_symptom INTEGER NOT NULL DEFAULT 0 CHECK(same_symptom IN (0,1)),
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 '''
 
 
@@ -330,32 +456,145 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
-def init_db() -> None:
-    now = to_storage(utc_now())
-    with transaction(immediate=True) as connection:
-        connection.executescript(SCHEMA)
-        connection.execute("PRAGMA user_version=2")
-        for code, name, resource, action in PERMISSIONS:
-            connection.execute(
-                "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
-                (code, name, resource, action),
-            )
-        roles = [
-            ("administrator", "系统管理员", "拥有全部系统权限"),
-            ("operator", "试点运营员", "维护目录、场地和体验场次"),
-            ("reviewer", "证据审阅员", "审阅产品证据与体验反馈"),
-            ("auditor", "审计查看员", "只读查看运行与审计记录"),
-        ]
-        for code, name, description in roles:
-            connection.execute(
-                "INSERT OR IGNORE INTO roles(code,name,description,is_system,created_at,updated_at) VALUES(?,?,?,1,?,?)",
-                (code, name, description, now, now),
-            )
-        administrator = connection.execute("SELECT id FROM roles WHERE code='administrator'").fetchone()[0]
+DEFAULT_SIGNAL_RULES = [
+    ("serious-any", "任一严重或危急事件即暂停", ["serious", "critical"], 1, 90 * 24 * 3600, 0),
+    ("cluster-same-symptom", "30天内同类症状信号聚集", ["moderate", "serious", "critical"], 3, 30 * 24 * 3600, 1),
+]
+
+
+def _seed_signal_rules(connection: sqlite3.Connection, now: str) -> None:
+    import json
+
+    for code, name, severities, min_count, window_seconds, same_symptom in DEFAULT_SIGNAL_RULES:
         connection.execute(
-            "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
-            (administrator, now),
+            "INSERT OR IGNORE INTO safety_signal_rules(code,name,severity_in_json,min_count,window_seconds,same_symptom,active,created_at,updated_at) VALUES(?,?,?,?,?,?,'1',?,?)",
+            (code, name, json.dumps(severities, ensure_ascii=False), min_count, window_seconds, same_symptom, now, now),
         )
+
+
+def _upgrade_to_version_3(connection: sqlite3.Connection) -> None:
+    session_columns = {row["name"] for row in connection.execute("PRAGMA table_info(pilot_sessions)").fetchall()}
+    protocol_columns = {row["name"] for row in connection.execute("PRAGMA table_info(pilot_protocols)").fetchall()}
+    table_sql = connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='pilot_sessions'").fetchone()
+    rebuild_needed = table_sql is not None and "'blocked'" not in (table_sql[0] or "")
+    # 必须在事务外设置：foreign_keys=OFF + legacy_alter_table=ON，
+    # RENAME 既不触发级联也不改写子表外键引用，新表沿用原名后引用继续有效。
+    if rebuild_needed:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute("PRAGMA legacy_alter_table=ON")
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if "product_code" not in protocol_columns:
+            connection.execute("ALTER TABLE pilot_protocols ADD COLUMN product_code TEXT NOT NULL DEFAULT ''")
+        if "product_code" not in session_columns:
+            connection.execute("ALTER TABLE pilot_sessions ADD COLUMN product_code TEXT NOT NULL DEFAULT ''")
+        if "blocked_by_decision_no" not in session_columns:
+            connection.execute("ALTER TABLE pilot_sessions ADD COLUMN blocked_by_decision_no TEXT NOT NULL DEFAULT ''")
+        if rebuild_needed:
+            connection.execute("ALTER TABLE pilot_sessions RENAME TO pilot_sessions_v2")
+            connection.execute(
+                """
+CREATE TABLE pilot_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    protocol_id INTEGER NOT NULL REFERENCES pilot_protocols(id) ON DELETE RESTRICT,
+    project_code TEXT NOT NULL,
+    product_code TEXT NOT NULL DEFAULT '',
+    requested_by TEXT NOT NULL,
+    parameters_json TEXT NOT NULL,
+    parameter_digest TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 50 CHECK(priority BETWEEN 0 AND 100),
+    idempotency_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','cancel_requested','cancelled','succeeded','failed','blocked','safety_hold')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
+    available_at TEXT NOT NULL,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_expires_at TEXT NOT NULL DEFAULT '',
+    blocked_by_decision_no TEXT NOT NULL DEFAULT '',
+    current_observation_version INTEGER,
+    last_error_code TEXT NOT NULL DEFAULT '',
+    last_error_message TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(requested_by, idempotency_key)
+)
+"""
+            )
+            connection.execute(
+                """
+INSERT INTO pilot_sessions(id,protocol_id,project_code,product_code,requested_by,parameters_json,parameter_digest,priority,idempotency_key,status,attempt_count,max_attempts,available_at,lease_owner,lease_expires_at,current_observation_version,last_error_code,last_error_message,version,started_at,finished_at,created_at,updated_at)
+SELECT id,protocol_id,project_code,'',requested_by,parameters_json,parameter_digest,priority,idempotency_key,status,attempt_count,max_attempts,available_at,lease_owner,lease_expires_at,current_observation_version,last_error_code,last_error_message,version,started_at,finished_at,created_at,updated_at FROM pilot_sessions_v2
+"""
+            )
+            connection.execute("DROP TABLE pilot_sessions_v2")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_pilot_queue ON pilot_sessions(status,priority DESC,available_at,created_at)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_pilot_sessions_product ON pilot_sessions(product_code,status)")
+    except Exception:
+        connection.rollback()
+        if rebuild_needed:
+            connection.execute("PRAGMA legacy_alter_table=OFF")
+            connection.execute("PRAGMA foreign_keys=ON")
+        raise
+    else:
+        connection.commit()
+        if rebuild_needed:
+            connection.execute("PRAGMA legacy_alter_table=OFF")
+            connection.execute("PRAGMA foreign_keys=ON")
+            violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError(f"升级后外键检查失败：{[tuple(row) for row in violations][:5]}")
+
+
+def _seed_access_control(connection: sqlite3.Connection, now: str) -> None:
+    for code, name, resource, action in PERMISSIONS:
+        connection.execute(
+            "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
+            (code, name, resource, action),
+        )
+    roles = [
+        ("administrator", "系统管理员", "拥有全部系统权限"),
+        ("operator", "试点运营员", "维护目录、场地和体验场次"),
+        ("reviewer", "证据审阅员", "审阅产品证据与体验反馈"),
+        ("auditor", "审计查看员", "只读查看运行与审计记录"),
+    ]
+    for code, name, description in roles:
+        connection.execute(
+            "INSERT OR IGNORE INTO roles(code,name,description,is_system,created_at,updated_at) VALUES(?,?,?,1,?,?)",
+            (code, name, description, now, now),
+        )
+    administrator = connection.execute("SELECT id FROM roles WHERE code='administrator'").fetchone()[0]
+    connection.execute(
+        "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
+        (administrator, now),
+    )
+
+
+def init_db() -> None:
+    connection = get_connection()
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0] or 0)
+    legacy_sessions = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pilot_sessions'"
+    ).fetchone()
+    # 旧库先补齐列并重建场次表，随后 SCHEMA 中依赖新列的索引才能创建。
+    if version < 3 and legacy_sessions is not None:
+        _upgrade_to_version_3(connection)
+    # executescript 会自行提交；CREATE TABLE IF NOT EXISTS 不会覆盖既有表。
+    connection.executescript(SCHEMA)
+    now = to_storage(utc_now())
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        _seed_access_control(connection, now)
+        _seed_signal_rules(connection, now)
+        if version < 3:
+            connection.execute("PRAGMA user_version=3")
+    except Exception:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
 
 
 def migrate_db() -> None:

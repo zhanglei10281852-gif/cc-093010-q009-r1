@@ -77,6 +77,7 @@ def pilot_demo() -> int:
                 "code": "gait-assist",
                 "name": "外骨骼步态体验方案",
                 "capability": "gait-assist",
+                "product_code": "exoskeleton-a",
                 "parameter_schema": {"minutes": {"type": "integer", "required": True, "minimum": 1, "maximum": 30}},
                 "default_parameters": {},
                 "max_runtime_seconds": 1800,
@@ -84,6 +85,7 @@ def pilot_demo() -> int:
             })
             submitted = client.post("/api/pilots/sessions", json={
                 "protocol_code": "gait-assist",
+                "product_code": "exoskeleton-a",
                 "project_code": "expo-2026",
                 "requested_by": "operator-demo",
                 "parameters": {"minutes": 8},

@@ -21,10 +21,10 @@ class PilotRepository:
         rows = self.connection.execute("SELECT * FROM pilot_protocols WHERE active=1 ORDER BY code,version").fetchall()
         return [dict(row) for row in rows]
 
-    def create_protocol(self, *, code: str, name: str, capability: str, parameter_schema: dict[str, Any], defaults: dict[str, Any], max_runtime_seconds: int, max_attempts: int, created_by: str, now: str) -> dict[str, Any]:
+    def create_protocol(self, *, code: str, name: str, capability: str, product_code: str, parameter_schema: dict[str, Any], defaults: dict[str, Any], max_runtime_seconds: int, max_attempts: int, created_by: str, now: str) -> dict[str, Any]:
         cursor = self.connection.execute(
-            "INSERT INTO pilot_protocols(code,name,capability,version,parameter_schema_json,default_parameters_json,max_runtime_seconds,max_attempts,active,created_by,created_at,updated_at) VALUES(?,?,?,1,?,?,?,?,1,?,?,?)",
-            (code, name, capability, json.dumps(parameter_schema, ensure_ascii=False, sort_keys=True), json.dumps(defaults, ensure_ascii=False, sort_keys=True), max_runtime_seconds, max_attempts, created_by, now, now),
+            "INSERT INTO pilot_protocols(code,name,capability,product_code,version,parameter_schema_json,default_parameters_json,max_runtime_seconds,max_attempts,active,created_by,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?,?,1,?,?,?)",
+            (code, name, capability, product_code, json.dumps(parameter_schema, ensure_ascii=False, sort_keys=True), json.dumps(defaults, ensure_ascii=False, sort_keys=True), max_runtime_seconds, max_attempts, created_by, now, now),
         )
         return dict(self.protocol_by_id(cursor.lastrowid))
 
@@ -51,10 +51,10 @@ class PilotRepository:
     def session_by_idempotency(self, requested_by: str, key: str) -> sqlite3.Row | None:
         return self.connection.execute("SELECT * FROM pilot_sessions WHERE requested_by=? AND idempotency_key=?", (requested_by, key)).fetchone()
 
-    def create_session(self, *, protocol_id: int, project_code: str, requested_by: str, parameters: dict[str, Any], parameter_digest: str, priority: int, idempotency_key: str, max_attempts: int, now: str) -> dict[str, Any]:
+    def create_session(self, *, protocol_id: int, product_code: str, project_code: str, requested_by: str, parameters: dict[str, Any], parameter_digest: str, priority: int, idempotency_key: str, max_attempts: int, now: str) -> dict[str, Any]:
         cursor = self.connection.execute(
-            "INSERT INTO pilot_sessions(protocol_id,project_code,requested_by,parameters_json,parameter_digest,priority,idempotency_key,status,attempt_count,max_attempts,available_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'queued',0,?,?,?,?)",
-            (protocol_id, project_code, requested_by, json.dumps(parameters, ensure_ascii=False, sort_keys=True), parameter_digest, priority, idempotency_key, max_attempts, now, now, now),
+            "INSERT INTO pilot_sessions(protocol_id,project_code,product_code,requested_by,parameters_json,parameter_digest,priority,idempotency_key,status,attempt_count,max_attempts,available_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,'queued',0,?,?,?,?)",
+            (protocol_id, project_code, product_code, requested_by, json.dumps(parameters, ensure_ascii=False, sort_keys=True), parameter_digest, priority, idempotency_key, max_attempts, now, now, now),
         )
         return dict(self.session_by_id(cursor.lastrowid))
 
@@ -67,7 +67,10 @@ class PilotRepository:
             condition = f" AND tpl.capability IN ({placeholders})"
             params.extend(capability_list)
         return self.connection.execute(
-            "SELECT t.*,tpl.capability AS protocol_capability FROM pilot_sessions t JOIN pilot_protocols tpl ON tpl.id=t.protocol_id WHERE t.status='queued' AND t.available_at<=?" + condition + " ORDER BY t.priority DESC,t.created_at ASC,t.id ASC LIMIT 1",
+            "SELECT t.*,tpl.capability AS protocol_capability FROM pilot_sessions t JOIN pilot_protocols tpl ON tpl.id=t.protocol_id "
+            "WHERE t.status='queued' AND t.available_at<=?" + condition +
+            " AND NOT EXISTS (SELECT 1 FROM safety_decisions d WHERE d.product_code=t.product_code AND d.action='product_suspension' AND d.status='active')"
+            " ORDER BY t.priority DESC,t.created_at ASC,t.id ASC LIMIT 1",
             params,
         ).fetchone()
 
